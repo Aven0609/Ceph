@@ -1,0 +1,223 @@
+RocksDB
+概述
+
+RocksDB是一个可嵌入的，持久型的Key-Value数据库，为更快速的存储环境而生。其设计基于Google开源的Leveldb，且优化了LevelDB中存在的一些问题。
+
+它具有如下特性：
+
+    高性能：存储引擎使用C++编写，key和value是任意大小的字节流
+
+    为快速存储而优化：为闪存和高速硬盘而特殊优化处理，最大限度发挥闪存和RAM的读写性能
+
+    可适配性：适合于多种不同工作量类型
+
+    基础和高级的数据库操作：提供基础的操作，如打开、关闭数据库、读写数据库和合并、压缩过滤等高级操作
+
+另外，RocksDB还提供了LevelDB所不具备的一些特性，或者说对LevelDB优化的地方：
+
+性能：
+
+    多线程compaction(Multithread compaction)，理论上要比单线程要快
+
+    多线程memtable插入(Multithread memtable inserts)
+
+    减少持有DB互斥锁(Reduced DB mutex holding)
+
+    基于level的压缩方式和整体压缩方式的优化
+
+    前缀布隆过滤器
+
+    Memtable布隆过滤器
+
+    单个布隆过滤器覆盖了整个SST文件
+
+    写锁优化
+
+    提高了Iter::Prev()的性能
+
+    进行SkipList查找的时候进行更少的比较操作
+
+    使用HugePage分配memtable内存
+
+特性：
+
+    列簇(Column Families)，可以将相关的Key存储在一起
+
+    Transactions和WriteBatchWithIndex
+
+    备份和检查点
+
+    合并操作，即原地更新，优化了modify的效率
+
+    压缩过滤器
+
+    Java支持
+
+    手动压缩与自动压缩可并行运行
+
+    持久缓存
+
+    批量数据加载
+
+可选择的数据结构和格式
+
+    为纯内存的用例使用纯表格格式
+
+    基于Vector和Hash的memtable格式
+
+    基于Clock的cache
+
+    插件化的information log
+
+可调节性：
+
+    速率调节
+
+可管理性：
+
+    数据统计
+
+    线程局部分析
+
+RocksDB中的Cache
+
+RocksDB使用Block Cache作为读Cache，用户可以传递给RocksDB实例一个期望的缓存大小。在同一个进程中，一个Cache对象可以被多个RocksDB实例所共享，并且允许用户控制所有的Cache大小。
+
+Block Cache存储的是未压缩的块，用户可以选择性地设置第二个块缓存，以用来存储已经压缩的块。如果设置了DirectIO，那么block cache可以用来代替操作系统的Page Cache。
+
+在RocksDB中实现了两种Cache替换算法，LRUCache和ClockCache。这两种类型的Cache都做了分片处理，以减小锁争用。Cache容量被被均匀地划分给每个分片。默认每个Cache会被划分为最多64个分片，每个分片的容量不少于512字节。
+LRUCache
+
+默认RocksDB会创建容量为8MB的LRUCache，如果用户要自己定义LRUCache的大小，可以通过调用NewLRUCache()来创建。
+
+比如在Ceph中使用RocksDB创建LRUCache：
+
+bbt_opts.block_cache = rocksdb::NewLRUCache(block_cache_size, g_conf->rocksdb_cache_shard_bits);
+
+其中block_cache_size指定了Block Cache总的大小，rocksdb_cache_shard_bits指定了分片个数，不指定的话按最大的64个分片作为默认值。
+ClockCache
+
+ClockCache基于Clock算法实现，比LRUCache有更精细的锁力度，因此比LRUCache读的吞吐性能要好些，下面是官网的测试数据：
+Threads 	Cache Size 	Cache Index/Filter 	ClockCache Throughput(MB/s) 	Hit 	LRUCache Throughput(MB/s) 	Hit
+32 	2GB 	yes 	466.7 	85.9% 	433.7 	86.5%
+32 	2GB 	no 	529.9 	72.7% 	532.7 	73.9%
+32 	64GB 	yes 	649.9 	99.9% 	507.9 	99.9%
+32 	64GB 	no 	740.4 	99.9% 	662.8 	99.9%
+16 	2GB 	yes 	278.4 	85.9% 	283.4 	86.5%
+16 	2GB 	no 	318.6 	72.7% 	335.8 	73.9%
+16 	64GB 	yes 	391.9 	99.9% 	353.3 	99.9%
+16 	64GB 	no 	433.8 	99.8% 	419.4 	99.8%
+
+在Ceph的场景中，Block Cache的大小默认设置为128MB，考虑到LRUCache在容量较小的时候，吞吐率略低，但是命中率要高，所以默认是使用的LRUCache。在实际RocksDB的时候还是要在Cache大小和命中率之间权衡，针对应用特点选择合适的Cache类型。
+RocksDB选项列表
+
+RocksDB中的选项大致分为两类：DBOptions和ColumnFamilyOptions。DBOptions是整个DB的选项，一般不需要我们去设置，我们需要关注的是ColumnFamilyOptions这些选项。Ceph中配置的各个可配置选项rocksdb_options也基本上是ColumnFamilyOptions类型的。
+DBOptions
+
+    recycle_log_file_num：重复利用的log文件数，默认为0，如果设置为非0，新的log会重用之前的log文件，并将旧的数据覆盖
+
+    compaction_readahead_size：进行compaction时的预读大小，默认为0
+
+    max_background_compactions：后台进行compact的最大并发数
+
+    max_background_flushes：flush操作的最大并发数
+
+ColumnFamilyOptions
+
+    write_buffer_size：默认为64MB，设置一个memtable的大小，一旦超过该大小，它会被标记为immutable，然后创建一个新的memtable
+
+    max_write_buffer_number：默认为2，一个ColumnFamily中允许的最大write buffer数
+
+    min_write_buffer_number_to_merge：write buffers在写入本地文件之前最小的合并个数，默认为1，表示
+
+    ompression：默认为kNoCompression，可选择kSnappyCompression。启用压缩时在kv size大的时候会影响性能
+
+    num_levels：默认为7，kvDB的lv数
+
+    level0_file_num_compaction_trigger：默认为4，
+
+    level0_slowdown_writes_trigger：默认为20（版本不同，该值可能会不同），当level0的sst文件超过多少个的时候，降低写入速度，为-1时表示禁用此功能
+
+    level0_stop_writes_trigger：默认为36（版本不同，该值可能会不同），当level0的sst文件超过多少个后将禁止写入
+
+    target_file_size_base：默认为64MB，每个level1的文件大小
+
+    target_file_size_multiplier：默认为1，计算下一级level大小的系数，为1则时，所有level的文件大小都一样
+
+    max_bytes_for_level_base：默认为256MB，一个level的文件最大大小
+
+    max_bytes_for_level_multiplier：默认为10，下一级level文件的最大小的系数，即最大为max_bytes_for_level_base * max_bytes_for_level_multiplier
+
+    max_compaction_bytes：所有已经经过compact的文件的最大字节数
+
+    hard_pending_compaction_bytes_limit：等待进行compact的字节数，默认为256GB，超出256GB则禁止写入
+
+    arena_block_size：RocksDB有自己的内存分配机制，称为Arena，由一系列的block组成，每个block的大小由arena_block_size指定，不指定时默认为write_buffer_size的1/8
+
+    disable_auto_compactions：禁止自动进行compaction，默认为false
+
+    compaction_style：默认为kCompactionStyleLevel。RocksDB目前支持两种compact模式，分别是kCompactionStyleLevel和kCompactionStyleUniversal。
+
+    max_sequential_skip_in_iterations：默认为8
+
+    inplace_update_support：默认为false
+
+    inplace_update_num_locks：用于原地更新的锁的数量，当inplace_update_support为true时，默认为10000，否则为0
+
+    memtable_prefix_bloom_size_ratio：默认为0
+
+    memtable_huge_page_size：试图从大页内存中为memtable分配的空间大小，默认为0
+
+BlueStore中RocksDB相关的配置
+选项 	名称
+rocksdb_cache_size 	rocksdb中总的cache大小(包括block cache和row cache)
+rocksdb_cache_row_ratio 	rocksdb中row cache占总Cache的比例，默认为0，即cache都给block cache用
+rocksdb_cache_type 	rocksdb中Block Cache的类型，可配置LRUCache和ClockCache
+rocksdb_block_size 	rocksdb中的块大小，默认为4KB
+rocksdb_cache_shard_bits 	rocksdb cache分片的位数，默认为4，即分片个数为2^4
+rocksdb_metadata_block_size 	memtable的块大小
+rocksdb_perf 	统计rocksdb的perf数据，默认为false
+rocksdb_collect_compaction_stats 	统计rocksdb compaction的状态信息，默认为false
+rocksdb_collect_extended_stats 	统计rocksdb额外的状态信息，默认为false
+rocksdb_collect_memory_stats 	统计rocksdb内存的状态信息，默认为false
+rocksdb_enable_rmrange 	允许删除一段范围内的kv对，默认为false
+rocksdb_bloom_bits_per_key 	rocksdb中用作布隆过滤器每个key的位数，默认为20
+rocksdb_cache_index_and_filter_blocks 	是否在block cache中缓存索引和过滤器
+rocksdb_cache_index_and_filter_blocks_with_high_priority 	是否使用高优先级在block cache中缓存索引和过滤器
+rocksdb_pin_l0_filter_and_index_blocks_in_cache 	将l0的索引和过滤器固定在block cache中
+rocksdb_index_type 	为SST文件而建立的索引类型，可选的有binary_search, hash_search, two_level，默认为binary_search
+rocksdb_partition_filters 	为SST文件索引分区，试验性功能，默认为false
+测试结果
+
+调节和write_buffer_size和min_write_buffer_number_to_merge参数，其它参数保持不变，以下为测试结果：
+
+测试环境：CentOS-7.3 Linux 3.10.0-514
+
+测试100000次Put和100000次Get，key和value都为1024字节
+
+{
+  auto start = chrono::system_clock::now();
+  for (int i = 0; i < TEST_COUNT; ++i) {
+    WriteOptions woptions;
+    s = db->Put(woptions, key[i], value[i]);
+    assert(s.ok());
+  }
+  auto end = chrono::system_clock::now();
+  chrono::duration<double> duration = end - start;
+  cout << TEST_COUNT << " times put: " << duration.count() << "s\n";
+}
+
+写测试结果
+
+{
+  string value_ret;
+  auto start = chrono::system_clock::now();
+  for (int i = 0; i < TEST_COUNT; ++i) {
+    s = db->Get(ReadOptions(), key[i], &value_ret);
+    assert(s.ok());
+    assert(value_ret == value[i]);
+  }
+  auto end = chrono::system_clock::now();
+  chrono::duration<double> duration = end - start;
+  cout << TEST_COUNT << " times get: " << duration.count() << "s\n";
+}
